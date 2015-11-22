@@ -4,15 +4,20 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.Abortable;
+import org.apache.hadoop.hbase.DaemonThreadFactory;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.classification.InterfaceStability;
-import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandler;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.GetRequest;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ScanRequest;
 import org.apache.hadoop.util.StringUtils;
@@ -25,148 +30,126 @@ public class CakeFirstLevelScheduler extends RpcScheduler {
 
   private static final Log LOG = LogFactory.getLog(CakeFirstLevelScheduler.class);
 
-  private final AtomicInteger activeHandlerCount = new AtomicInteger(0);
+  private final AtomicInteger failedHandlerCount = new AtomicInteger(0);
 
-  BlockingQueue<CallRunner> highPriorityQueue;
-  BlockingQueue<CallRunner> lowPriorityQueue;
+  private final Configuration conf;
+  private final Abortable abortable;
 
-  private AtomicInteger numHandlers;
-  private boolean running;
+  private final int LOW_PRIORITY_INDEX = 0;
+  private final int HIGH_PRIORITY_INDEX = 1;
+  private final int numQueues = 2;
 
-  private AtomicInteger totalHighPriorityHandlers;
-  private AtomicInteger totalLowPriorityHandlers;
+  List<BlockingQueue<Runnable>> callQueues = new ArrayList<>();
+  List<ThreadPoolExecutor> executors = new ArrayList<>();
+  List<Integer> numHandlers = new ArrayList<>();
 
-  private AtomicInteger currHighPriorityHandlers = new AtomicInteger(0);
-  private AtomicInteger currLowPriorityHandlers = new AtomicInteger(0);
+  private int numAllHandlers;
 
-  private List<Thread> handlers;
+  public CakeFirstLevelScheduler(Configuration conf, Abortable abortable) {
+    this.conf = conf;
+    this.abortable = abortable;
+  }
 
   @Override
   public void init(Context context) {
-    numHandlers = new AtomicInteger(CakeConstants.MAX_HBASE_HANDLERS);
-    handlers = new ArrayList<Thread>(numHandlers.get());
+    numAllHandlers = CakeConstants.MAX_HBASE_HANDLERS;
     setHighPriorityClientShare(CakeConstants.HIGH_PRIORITY_INITIAL_SHARE);
+    for (int i = 0; i < numQueues; ++i) {
+      callQueues.add(new LinkedBlockingQueue<Runnable>());
+    }
   }
 
   @Override
   public void start() {
-    running = true;
-    startHandlers();
-  }
-
-  private void startHandlers() {
-    for (int i = 0; i < numHandlers.get(); i++) {
-      final BlockingQueue<Thread> queue = null
-      Thread t = new Thread(new Runnable() {
-        @Override
-        public void run() {
-          if (i % 2 == 0 && !currHighPriorityHandlers.equals(totalHighPriorityHandlers)) {
-            consumerLoop(hight);
-          } 
-        }
-      });
-      t.setDaemon(true);
-      t.start();
-      LOG.debug("Cake RPC handlers starts");
-      handlers.add(t);
-    }
-  }
-
-  private void consumerLoop(final BlockingQueue<CallRunner> myQueue) {
-    boolean interrupted = false;
-    double handlerFailureThreshhold = conf == null ? 1.0
-        : conf.getDouble(HConstants.REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT,
-          HConstants.DEFAULT_REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT);
-    try {
-      while (running) {
-        try {
-          MonitoredRPCHandler status = RpcServer.getStatus();
-          CallRunner task = myQueue.take();
-          task.setStatus(status);
-          try {
-            activeHandlerCount.incrementAndGet();
-            task.run();
-          } catch (Throwable e) {
-            if (e instanceof Error) {
-              int failedCount = failedHandlerCount.incrementAndGet();
-              if (handlerFailureThreshhold >= 0
-                  && failedCount > handlerCount * handlerFailureThreshhold) {
-                String message = "Number of failed RpcServer handler exceeded threshhold "
-                    + handlerFailureThreshhold + "  with failed reason: "
-                    + StringUtils.stringifyException(e);
-                if (abortable != null) {
-                  abortable.abort(message, e);
-                } else {
-                  LOG.error("Received " + StringUtils.stringifyException(e)
-                      + " but not aborting due to abortable being null");
-                  throw e;
-                }
-              } else {
-                LOG.warn("RpcServer handler threads encountered errors "
-                    + StringUtils.stringifyException(e));
-              }
-            } else {
-              LOG.warn("RpcServer handler threads encountered exceptions "
-                  + StringUtils.stringifyException(e));
-            }
-          } finally {
-            activeHandlerCount.decrementAndGet();
-          }
-        } catch (InterruptedException e) {
-          interrupted = true;
-        }
-      }
-    } finally {
-      if (interrupted) {
-        Thread.currentThread().interrupt();
-      }
+    for (int i = 0; i < numQueues; ++i) {
+      this.executors
+          .add(new ThreadPoolExecutor(numHandlers.get(i), numHandlers.get(i), 60, TimeUnit.SECONDS,
+              callQueues.get(i), new DaemonThreadFactory("CakeHighPriorityRpcScheduler.handler"),
+              new ThreadPoolExecutor.CallerRunsPolicy()));
     }
   }
 
   @Override
   public void stop() {
-    running = false;
-    for (Thread handler : handlers) {
-      handler.interrupt();
+    for (ThreadPoolExecutor executor : executors) {
+      executor.shutdown();
     }
   }
 
   @Override
-  public void dispatch(CallRunner task) throws IOException, InterruptedException {
+  public void dispatch(final CallRunner task) throws IOException, InterruptedException {
     Message request = task.getCall().param;
+    int index = 0;
     if (request instanceof GetRequest) {
-      highPriorityQueue.put(task);
+      index = HIGH_PRIORITY_INDEX;
     } else if (request instanceof ScanRequest) {
-      lowPriorityQueue.put(task);
+      index = LOW_PRIORITY_INDEX;
     }
+    LOG.debug("Start executing task on Cake executor");
+    executors.get(index).submit(new Runnable() {
+      @Override
+      public void run() {
+        double handlerFailureThreshhold = conf == null ? 1.0
+            : conf.getDouble(HConstants.REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT,
+              HConstants.DEFAULT_REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT);
+        task.setStatus(RpcServer.getStatus());
+        try {
+          task.run();
+        } catch (Throwable e) {
+          if (e instanceof Error) {
+            int failedCount = failedHandlerCount.incrementAndGet();
+            if (handlerFailureThreshhold >= 0
+                && failedCount > CakeConstants.MAX_HBASE_HANDLERS * handlerFailureThreshhold) {
+              String message =
+                  "Number of failed Cake Rpchandler exceeded threshhold " + handlerFailureThreshhold
+                      + "  with failed reason: " + StringUtils.stringifyException(e);
+              if (abortable != null) {
+                abortable.abort(message, e);
+              } else {
+                LOG.error("Received " + StringUtils.stringifyException(e)
+                    + " but not aborting due to abortable being null");
+                throw e;
+              }
+            } else {
+              LOG.warn(
+                "Cake Rpc handler threads encountered errors " + StringUtils.stringifyException(e));
+            }
+          } else {
+            LOG.warn("Cake Rpc handler threads encountered exceptions "
+                + StringUtils.stringifyException(e));
+          }
+        }
+      }
+    });
   }
 
   @Override
   public int getGeneralQueueLength() {
-    // TODO Auto-generated method stub
-    return 0;
+    return callQueues.get(LOW_PRIORITY_INDEX).size() + callQueues.get(HIGH_PRIORITY_INDEX).size();
   }
 
   @Override
   public int getPriorityQueueLength() {
-    // TODO Auto-generated method stub
     return 0;
   }
 
   @Override
   public int getReplicationQueueLength() {
-    // TODO Auto-generated method stub
     return 0;
   }
 
   @Override
   public int getActiveRpcHandlerCount() {
-    // TODO Auto-generated method stub
-    return 0;
+    return executors.get(LOW_PRIORITY_INDEX).getActiveCount()
+        + executors.get(HIGH_PRIORITY_INDEX).getActiveCount();
   }
 
   void setHighPriorityClientShare(double highPriorityClientShare) {
-    totalHighPriorityHandlers.set((int) (numHandlers.get() * highPriorityClientShare));
-    totalLowPriorityHandlers.set(numHandlers.get() - totalHighPriorityHandlers.get());
+    numHandlers.set(HIGH_PRIORITY_INDEX, (int) (numAllHandlers * highPriorityClientShare));
+    numHandlers.set(LOW_PRIORITY_INDEX, numAllHandlers - numHandlers.get(HIGH_PRIORITY_INDEX));
+    for (int i = 0; i < executors.size(); ++i) {
+      executors.get(i).setCorePoolSize(numHandlers.get(i));
+      executors.get(i).setMaximumPoolSize(numHandlers.get(i));
+    }
   }
 }
