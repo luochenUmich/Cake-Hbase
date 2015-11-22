@@ -62,10 +62,11 @@ public class CakeFirstLevelScheduler extends RpcScheduler {
   @Override
   public void start() {
     for (int i = 0; i < numQueues; ++i) {
-      this.executors
-          .add(new ThreadPoolExecutor(numHandlers.get(i), numHandlers.get(i), 60, TimeUnit.SECONDS,
-              callQueues.get(i), new DaemonThreadFactory("CakeHighPriorityRpcScheduler.handler"),
-              new ThreadPoolExecutor.CallerRunsPolicy()));
+      String handlerName = String.format("Cake%s.handler",
+        i == HIGH_PRIORITY_INDEX ? "HighPriority" : "LowPriority");
+      this.executors.add(new ThreadPoolExecutor(numHandlers.get(i), numHandlers.get(i), 60,
+          TimeUnit.SECONDS, callQueues.get(i), new DaemonThreadFactory(handlerName),
+          new ThreadPoolExecutor.CallerRunsPolicy()));
     }
   }
 
@@ -79,10 +80,12 @@ public class CakeFirstLevelScheduler extends RpcScheduler {
   @Override
   public void dispatch(final CallRunner task) throws IOException, InterruptedException {
     Message request = task.getCall().param;
-    int index = 0;
+    int index = LOW_PRIORITY_INDEX;
     if (request instanceof GetRequest) {
+      System.out.println("High Priority Request");
       index = HIGH_PRIORITY_INDEX;
     } else if (request instanceof ScanRequest) {
+      LOG.info("LOW Priority Request come in");
       index = LOW_PRIORITY_INDEX;
     }
     LOG.debug("Start executing task on Cake executor");
@@ -145,6 +148,10 @@ public class CakeFirstLevelScheduler extends RpcScheduler {
   }
 
   void setHighPriorityClientShare(double highPriorityClientShare) {
+    // make sure numHandlers has enough elements
+    while (numHandlers.size() < numQueues) {
+      numHandlers.add(0);
+    }
     numHandlers.set(HIGH_PRIORITY_INDEX, (int) (numAllHandlers * highPriorityClientShare));
     numHandlers.set(LOW_PRIORITY_INDEX, numAllHandlers - numHandlers.get(HIGH_PRIORITY_INDEX));
     for (int i = 0; i < executors.size(); ++i) {
